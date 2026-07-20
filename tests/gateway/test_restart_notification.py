@@ -1,5 +1,7 @@
 """Tests for /restart notification — the gateway notifies the requester on comeback."""
 
+import asyncio
+import inspect
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -373,6 +375,14 @@ async def test_send_home_channel_startup_notification_ignores_false_send_result(
 # ── _send_restart_notification ───────────────────────────────────────────
 
 
+def test_gateway_start_wires_pending_restart_to_retry_watcher():
+    """Startup must schedule retries when the immediate notification defers."""
+    source = inspect.getsource(gateway_run.GatewayRunner.start)
+    assert "restart_target = await self._send_restart_notification()" in source
+    assert "if restart_target is None and _restart_notification_pending():" in source
+    assert "self._schedule_restart_notification_watch()" in source
+
+
 @pytest.mark.asyncio
 async def test_send_restart_notification_delivers_and_cleans_up(tmp_path, monkeypatch):
     """On startup, the notification is sent and the file is removed."""
@@ -442,21 +452,32 @@ async def test_send_restart_notification_noop_when_no_file(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_send_restart_notification_skips_when_adapter_missing(tmp_path, monkeypatch):
-    """If the requester's platform isn't connected, clean up without crashing."""
+async def test_send_restart_notification_preserves_when_adapter_missing(tmp_path, monkeypatch):
+    """A platform still reconnecting keeps its notification pending."""
+    from gateway.platforms.base import SendResult
+
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
 
     notify_path = tmp_path / ".restart_notify.json"
     notify_path.write_text(json.dumps({
-        "platform": "discord",  # runner only has telegram adapter
+        "platform": "discord",  # runner initially only has telegram adapter
         "chat_id": "42",
     }))
 
     runner, _adapter = make_restart_runner()
 
     await runner._send_restart_notification()
+    assert notify_path.exists()
 
-    # File cleaned up even though we couldn't send
+    recovered_adapter = MagicMock()
+    recovered_adapter.send = AsyncMock(
+        return_value=SendResult(success=True, message_id="recovered")
+    )
+    runner.adapters[Platform.DISCORD] = recovered_adapter
+
+    await runner._watch_restart_notification(poll_interval=0, timeout=1)
+
+    recovered_adapter.send.assert_awaited_once()
     assert not notify_path.exists()
 
 
@@ -534,6 +555,110 @@ async def test_send_restart_notification_logs_warning_on_sendresult_failure(
     )
     # Still cleans up.
     assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_send_restart_notification_retryable_failure_preserves_marker(
+    tmp_path, monkeypatch, caplog
+):
+    """A transient adapter failure must remain pending for the startup watcher."""
+    from gateway.platforms.base import SendResult
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(return_value=SendResult(
+        success=False,
+        error="send_path_degraded",
+        retryable=True,
+    ))
+
+    with caplog.at_level("INFO", logger="gateway.run"):
+        delivered_target = await runner._send_restart_notification()
+
+    assert delivered_target is None
+    assert notify_path.exists()
+    assert any(
+        "deferred" in record.getMessage()
+        and "send_path_degraded" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_watcher_retries_until_delivery(
+    tmp_path, monkeypatch
+):
+    """The watcher retries a preserved marker and removes it after recovery."""
+    from gateway.platforms.base import SendResult
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock(side_effect=[
+        SendResult(success=False, error="send_path_degraded", retryable=True),
+        SendResult(success=True, message_id="sent-after-recovery"),
+    ])
+
+    assert await runner._send_restart_notification() is None
+    assert notify_path.exists()
+
+    await runner._watch_restart_notification(poll_interval=0, timeout=1)
+
+    assert adapter.send.await_count == 2
+    assert not notify_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_watcher_is_singleton():
+    """Repeated startup scheduling must not create duplicate delivery tasks."""
+    runner, _adapter = make_restart_runner()
+    release = asyncio.Event()
+    runner._watch_restart_notification = AsyncMock(side_effect=release.wait)
+
+    runner._schedule_restart_notification_watch()
+    first_task = runner._restart_notification_task
+    assert first_task in runner._background_tasks
+    runner._schedule_restart_notification_watch()
+
+    assert runner._restart_notification_task is first_task
+    release.set()
+    await first_task
+    runner._watch_restart_notification.assert_awaited_once()
+    assert first_task not in runner._background_tasks
+
+
+@pytest.mark.asyncio
+async def test_restart_notification_watcher_timeout_preserves_marker(
+    tmp_path, monkeypatch, caplog
+):
+    """A bounded watcher stops cleanly without discarding an unsent marker."""
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    notify_path = tmp_path / ".restart_notify.json"
+    notify_path.write_text(json.dumps({
+        "platform": "telegram",
+        "chat_id": "42",
+    }))
+
+    runner, adapter = make_restart_runner()
+    adapter.send = AsyncMock()
+
+    with caplog.at_level("WARNING", logger="gateway.run"):
+        await runner._watch_restart_notification(poll_interval=0, timeout=0)
+
+    adapter.send.assert_not_called()
+    assert notify_path.exists()
+    assert any("marker preserved" in record.getMessage() for record in caplog.records)
 
 
 @pytest.mark.asyncio
