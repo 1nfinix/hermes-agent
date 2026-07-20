@@ -13,6 +13,9 @@ from tools.approval import (
 
 @pytest.fixture(autouse=True)
 def _clear_approval_state():
+    from gateway.session_context import reset_session_vars
+
+    reset_session_vars()
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
@@ -20,6 +23,7 @@ def _clear_approval_state():
     approval_module._permanent_approved.clear()
     approval_module.clear_session("default")
     approval_module.clear_session("test-session")
+    reset_session_vars()
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +90,42 @@ class TestCronApprovalModeParsing:
 # ---------------------------------------------------------------------------
 # check_dangerous_command() with cron session
 # ---------------------------------------------------------------------------
+
+class TestCronSessionIsolation:
+    def test_scheduler_uses_task_local_cron_marker(self):
+        import inspect
+
+        from cron.scheduler import run_job
+
+        source = inspect.getsource(run_job)
+        assert 'os.environ["HERMES_CRON_SESSION"]' not in source
+        assert "cron_session=True" in source
+
+    def test_gateway_context_overrides_stale_process_cron_flag(self, monkeypatch):
+        """An embedded scheduler must not make a Telegram turn look like cron."""
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        tokens = set_session_vars(platform="telegram", cron_session=False)
+        try:
+            assert approval_module._is_cron_session() is False
+            assert approval_module._is_gateway_approval_context() is True
+        finally:
+            clear_session_vars(tokens)
+            reset_session_vars()
+
+    def test_cron_context_is_task_local_without_process_env(self, monkeypatch):
+        from gateway.session_context import clear_session_vars, reset_session_vars, set_session_vars
+
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        tokens = set_session_vars(platform="", cron_session=True)
+        try:
+            assert approval_module._is_cron_session() is True
+            assert approval_module._is_gateway_approval_context() is False
+        finally:
+            clear_session_vars(tokens)
+            reset_session_vars()
+
 
 class TestCronDenyMode:
     """When HERMES_CRON_SESSION is set and cron_mode=deny, dangerous commands are blocked."""
@@ -380,7 +420,7 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="123")
+        tokens = set_session_vars(platform="telegram", chat_id="123", cron_session=True)
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
@@ -402,7 +442,7 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="discord", chat_id="456")
+        tokens = set_session_vars(platform="discord", chat_id="456", cron_session=True)
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
@@ -422,7 +462,7 @@ class TestCronWithGatewayOrigin:
         monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
 
         from gateway.session_context import set_session_vars, clear_session_vars
-        tokens = set_session_vars(platform="telegram", chat_id="789")
+        tokens = set_session_vars(platform="telegram", chat_id="789", cron_session=True)
         try:
             from unittest.mock import patch as mock_patch
             with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):

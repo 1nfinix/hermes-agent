@@ -112,6 +112,28 @@ def test_set_session_vars_engages_and_overrides_foreign_global(monkeypatch):
     assert env.get("HERMES_SESSION_KEY") == "agent:main:discord:group:MY_BUGS_ROOT:111"
 
 
+def test_gateway_context_clears_stale_process_cron_flag(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    tokens = set_session_vars(platform="telegram", chat_id="owner", cron_session=False)
+    try:
+        env = _make_run_env({})
+    finally:
+        clear_session_vars(tokens)
+
+    assert env.get("HERMES_CRON_SESSION", "") == ""
+
+
+def test_cron_context_propagates_to_child_without_process_global(monkeypatch):
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    tokens = set_session_vars(platform="", cron_session=True)
+    try:
+        env = _make_run_env({})
+    finally:
+        clear_session_vars(tokens)
+
+    assert env.get("HERMES_CRON_SESSION") == "1"
+
+
 def test_engaged_strips_all_session_vars_when_unset(monkeypatch):
     """The strip covers every HERMES_SESSION_* mirror, not just the key."""
     _engage()
